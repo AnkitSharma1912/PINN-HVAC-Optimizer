@@ -42,41 +42,34 @@ EPOCHS_P1 = st.sidebar.slider("Phase 1 Epochs (Physics Training)", 1000, 20000, 
 EPOCHS_P2 = st.sidebar.slider("Phase 2 Epochs (Optimization)", 100, 2000, 1000, step=100)
 
 # --- 2. PHYSICS CONSTANTS & DATA GENERATORS ---
-ROOM_SIZE = 10.0  # 10m x 10m (2D) or 10m x 10m x 10m (3D)
+ROOM_SIZE = 10.0
 N_INT = 1000
 N_BND = 600 if is_3d else 400
-WALL_TEMP, HEATER_POWER, HEATER_SPREAD = 10.0, 50.0, 1.5
+WALL_TEMP = 10.0
+HEATER_POWER = 85.0 if is_3d else 50.0
+HEATER_SPREAD = 1.8 if is_3d else 1.5
 
-def generate_data_2d():
-    x_int = (torch.rand(N_INT, 1) * ROOM_SIZE).requires_grad_(True)
-    y_int = (torch.rand(N_INT, 1) * ROOM_SIZE).requires_grad_(True)
+def generate_bnd_2d():
     pts = N_BND // 4
     r = torch.rand(pts, 1) * ROOM_SIZE
     z = torch.zeros(pts, 1)
     f = torch.full((pts, 1), ROOM_SIZE)
-    
     x_bnd = torch.cat([r, r, z, f])
     y_bnd = torch.cat([z, f, r, r])
-    return x_int, y_int, x_bnd, y_bnd
+    return x_bnd, y_bnd
 
-def generate_data_3d():
-    x_int = (torch.rand(N_INT, 1) * ROOM_SIZE).requires_grad_(True)
-    y_int = (torch.rand(N_INT, 1) * ROOM_SIZE).requires_grad_(True)
-    z_int = (torch.rand(N_INT, 1) * ROOM_SIZE).requires_grad_(True)
-    
-    pts = N_BND // 6  # 6 surfaces: 4 walls + floor + ceiling
+def generate_bnd_3d():
+    pts = N_BND // 6
     r1 = torch.rand(pts, 1) * ROOM_SIZE
     r2 = torch.rand(pts, 1) * ROOM_SIZE
     z = torch.zeros(pts, 1)
     f = torch.full((pts, 1), ROOM_SIZE)
-    
-    # x=0, x=10, y=0, y=10, z=0 (floor), z=10 (ceiling)
     x_bnd = torch.cat([z, f, r1, r1, r1, r1])
     y_bnd = torch.cat([r1, r1, z, f, r2, r2])
     z_bnd = torch.cat([r2, r2, r2, r2, z, f])
-    return x_int, y_int, z_int, x_bnd, y_bnd, z_bnd
+    return x_bnd, y_bnd, z_bnd
 
-# --- 3. MODULAR PINN ARCHITECTURE (6-Input for 2D, 9-Input for 3D) ---
+# --- 3. MODULAR PINN ARCHITECTURE ---
 class SmartHeatPINN(nn.Module):
     def __init__(self, in_features):
         super().__init__()
@@ -97,7 +90,7 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
     
     if not is_3d:
         # ================= 2D EXECUTION =================
-        x_int, y_int, x_bnd, y_bnd = generate_data_2d()
+        x_bnd, y_bnd = generate_bnd_2d()
         model = SmartHeatPINN(in_features=6)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
 
@@ -105,11 +98,23 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
         p1_bar = st.progress(0)
         p1_text = st.empty()
 
+        half = N_INT // 2
         for epoch in range(EPOCHS_P1):
             optimizer.zero_grad()
-            h1x_r, h1y_r = torch.rand_like(x_int) * ROOM_SIZE, torch.rand_like(x_int) * ROOM_SIZE
-            h2x_r, h2y_r = torch.rand_like(x_int) * ROOM_SIZE, torch.rand_like(x_int) * ROOM_SIZE
-            
+            h1x_r = torch.rand(N_INT, 1) * ROOM_SIZE
+            h1y_r = torch.rand(N_INT, 1) * ROOM_SIZE
+            h2x_r = torch.rand(N_INT, 1) * ROOM_SIZE
+            h2y_r = torch.rand(N_INT, 1) * ROOM_SIZE
+
+            # Importance sampling: 50% random room points + 50% near heaters
+            x_u = torch.rand(half, 1) * ROOM_SIZE
+            y_u = torch.rand(half, 1) * ROOM_SIZE
+            x_h = torch.clamp(h1x_r[:half] + torch.randn(half, 1) * HEATER_SPREAD, 0.1, ROOM_SIZE - 0.1)
+            y_h = torch.clamp(h1y_r[:half] + torch.randn(half, 1) * HEATER_SPREAD, 0.1, ROOM_SIZE - 0.1)
+
+            x_int = torch.cat([x_u, x_h], dim=0).detach().requires_grad_(True)
+            y_int = torch.cat([y_u, y_h], dim=0).detach().requires_grad_(True)
+
             T_int = model(x_int, y_int, h1x_r, h1y_r, h2x_r, h2y_r)
             dT_dx = torch.autograd.grad(T_int, x_int, torch.ones_like(T_int), create_graph=True)[0]
             dT_dy = torch.autograd.grad(T_int, y_int, torch.ones_like(T_int), create_graph=True)[0]
@@ -127,7 +132,7 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
             T_bnd = model(x_bnd, y_bnd, h1x_b, h1y_b, h2x_b, h2y_b)
             bc_loss = torch.mean((T_bnd - WALL_TEMP)**2)
 
-            loss = pde_loss + 10.0 * bc_loss
+            loss = pde_loss + 15.0 * bc_loss
             loss.backward()
             optimizer.step()
 
@@ -143,8 +148,11 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
         for param in model.parameters():
             param.requires_grad = False
 
+        x_eval = (torch.rand(N_INT, 1) * ROOM_SIZE)
+        y_eval = (torch.rand(N_INT, 1) * ROOM_SIZE)
+
         h_params = nn.Parameter(torch.tensor([start_h1_x, start_h1_y, start_h2_x, start_h2_y], dtype=torch.float32))
-        h_optimizer = torch.optim.Adam([h_params], lr=0.1)
+        h_optimizer = torch.optim.Adam([h_params], lr=0.08)
         h1_path_x, h1_path_y, h2_path_x, h2_path_y = [], [], [], []
         p2_bar = st.progress(0)
         p2_text = st.empty()
@@ -156,13 +164,18 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
             h2_path_x.append(h_params[2].item())
             h2_path_y.append(h_params[3].item())
 
-            hx1, hy1 = h_params[0] * torch.ones_like(x_int), h_params[1] * torch.ones_like(x_int)
-            hx2, hy2 = h_params[2] * torch.ones_like(x_int), h_params[3] * torch.ones_like(x_int)
-            T_pred = model(x_int, y_int, hx1, hy1, hx2, hy2)
-            loss_opt = torch.mean((T_pred - target_temp)**2)
+            hx1, hy1 = h_params[0] * torch.ones_like(x_eval), h_params[1] * torch.ones_like(x_eval)
+            hx2, hy2 = h_params[2] * torch.ones_like(x_eval), h_params[3] * torch.ones_like(x_eval)
+            T_pred = model(x_eval, y_eval, hx1, hy1, hx2, hy2)
+            
+            # Distance repulsion so heaters don't merge into 1 point
+            dist_heaters = (h_params[0] - h_params[2])**2 + (h_params[1] - h_params[3])**2
+            repulsion = 25.0 / (dist_heaters + 0.5)
+
+            loss_opt = torch.mean((T_pred - target_temp)**2) + repulsion
             loss_opt.backward()
             h_optimizer.step()
-            h_params.data.clamp_(0.5, ROOM_SIZE - 0.5)
+            h_params.data.clamp_(1.0, ROOM_SIZE - 1.0)
 
             if epoch % (EPOCHS_P2 // 10) == 0:
                 p2_bar.progress(epoch / EPOCHS_P2)
@@ -175,7 +188,7 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
         colA.metric("Optimal Heater 1 (2D)", f"X: {h_params[0].item():.2f}m, Y: {h_params[1].item():.2f}m")
         colB.metric("Optimal Heater 2 (2D)", f"X: {h_params[2].item():.2f}m, Y: {h_params[3].item():.2f}m")
 
-        # 2D Plotting
+        # 2D Plotting with Clean 5°C, 10°C, 15°C... Ticks
         st.write("### 📊 Final 2D Thermal Heatmap & Path")
         grid_pts = np.linspace(0, ROOM_SIZE, 100)
         X, Y = np.meshgrid(grid_pts, grid_pts)
@@ -189,10 +202,18 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
                 h_params[2] * torch.ones_like(X_flat), h_params[3] * torch.ones_like(X_flat)
             ).numpy().reshape(100, 100)
 
+        # Force clean 5°C intervals on the colorbar
+        t_min = 5
+        t_max = max(35, int(np.ceil(T_final.max() / 5.0) * 5))
+        clean_ticks = np.arange(t_min, t_max + 1, 5)
+        levels = np.linspace(t_min, t_max, 60)
+
         fig, ax = plt.subplots(figsize=(10, 8))
-        contour = ax.contourf(X, Y, T_final, levels=50, cmap=cm.inferno)
-        cbar = fig.colorbar(contour)
-        cbar.set_label('Temperature (°C)')
+        contour = ax.contourf(X, Y, np.clip(T_final, t_min, t_max), levels=levels, cmap=cm.inferno, vmin=t_min, vmax=t_max)
+        cbar = fig.colorbar(contour, ax=ax, ticks=clean_ticks)
+        cbar.ax.set_yticklabels([f"{t}°C" for t in clean_ticks])
+        cbar.set_label('Temperature (°C)', fontsize=12)
+
         ax.plot(h1_path_x, h1_path_y, color='cyan', linestyle='--', linewidth=2, label='H1 Path')
         ax.plot(h2_path_x, h2_path_y, color='lime', linestyle='--', linewidth=2, label='H2 Path')
         ax.scatter([h1_path_x[0], h2_path_x[0]], [h1_path_y[0], h2_path_y[0]], color='blue', s=100, label='Start Position')
@@ -204,7 +225,7 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
 
     else:
         # ================= 3D EXECUTION =================
-        x_int, y_int, z_int, x_bnd, y_bnd, z_bnd = generate_data_3d()
+        x_bnd, y_bnd, z_bnd = generate_bnd_3d()
         model = SmartHeatPINN(in_features=9)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
 
@@ -212,10 +233,26 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
         p1_bar = st.progress(0)
         p1_text = st.empty()
 
+        half = N_INT // 2
+        q1 = N_INT // 4
         for epoch in range(EPOCHS_P1):
             optimizer.zero_grad()
-            h1x_r, h1y_r, h1z_r = torch.rand_like(x_int)*ROOM_SIZE, torch.rand_like(x_int)*ROOM_SIZE, torch.rand_like(x_int)*ROOM_SIZE
-            h2x_r, h2y_r, h2z_r = torch.rand_like(x_int)*ROOM_SIZE, torch.rand_like(x_int)*ROOM_SIZE, torch.rand_like(x_int)*ROOM_SIZE
+            h1x_r, h1y_r, h1z_r = torch.rand(N_INT, 1)*ROOM_SIZE, torch.rand(N_INT, 1)*ROOM_SIZE, torch.rand(N_INT, 1)*ROOM_SIZE
+            h2x_r, h2y_r, h2z_r = torch.rand(N_INT, 1)*ROOM_SIZE, torch.rand(N_INT, 1)*ROOM_SIZE, torch.rand(N_INT, 1)*ROOM_SIZE
+
+            # 3D Importance Sampling: 50% uniform + 25% near H1 + 25% near H2
+            x_u, y_u, z_u = torch.rand(half, 1)*ROOM_SIZE, torch.rand(half, 1)*ROOM_SIZE, torch.rand(half, 1)*ROOM_SIZE
+            x_h1 = torch.clamp(h1x_r[:q1] + torch.randn(q1, 1)*HEATER_SPREAD, 0.1, ROOM_SIZE-0.1)
+            y_h1 = torch.clamp(h1y_r[:q1] + torch.randn(q1, 1)*HEATER_SPREAD, 0.1, ROOM_SIZE-0.1)
+            z_h1 = torch.clamp(h1z_r[:q1] + torch.randn(q1, 1)*HEATER_SPREAD, 0.1, ROOM_SIZE-0.1)
+
+            x_h2 = torch.clamp(h2x_r[:q1] + torch.randn(q1, 1)*HEATER_SPREAD, 0.1, ROOM_SIZE-0.1)
+            y_h2 = torch.clamp(h2y_r[:q1] + torch.randn(q1, 1)*HEATER_SPREAD, 0.1, ROOM_SIZE-0.1)
+            z_h2 = torch.clamp(h2z_r[:q1] + torch.randn(q1, 1)*HEATER_SPREAD, 0.1, ROOM_SIZE-0.1)
+
+            x_int = torch.cat([x_u, x_h1, x_h2], dim=0).detach().requires_grad_(True)
+            y_int = torch.cat([y_u, y_h1, y_h2], dim=0).detach().requires_grad_(True)
+            z_int = torch.cat([z_u, z_h1, z_h2], dim=0).detach().requires_grad_(True)
 
             T_int = model(x_int, y_int, z_int, h1x_r, h1y_r, h1z_r, h2x_r, h2y_r, h2z_r)
             dT_dx = torch.autograd.grad(T_int, x_int, torch.ones_like(T_int), create_graph=True)[0]
@@ -231,7 +268,6 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
             Q = HEATER_POWER * torch.exp(-dist1 / (2 * HEATER_SPREAD**2)) + \
                 HEATER_POWER * torch.exp(-dist2 / (2 * HEATER_SPREAD**2))
             
-            # 3D Poisson Heat Equation: d2T/dx2 + d2T/dy2 + d2T/dz2 + Q = 0
             pde_loss = torch.mean((d2T_dx2 + d2T_dy2 + d2T_dz2 + Q)**2)
 
             h1x_b, h1y_b, h1z_b = torch.rand_like(x_bnd)*ROOM_SIZE, torch.rand_like(x_bnd)*ROOM_SIZE, torch.rand_like(x_bnd)*ROOM_SIZE
@@ -239,7 +275,7 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
             T_bnd = model(x_bnd, y_bnd, z_bnd, h1x_b, h1y_b, h1z_b, h2x_b, h2y_b, h2z_b)
             bc_loss = torch.mean((T_bnd - WALL_TEMP)**2)
 
-            loss = pde_loss + 10.0 * bc_loss
+            loss = pde_loss + 15.0 * bc_loss
             loss.backward()
             optimizer.step()
 
@@ -255,8 +291,12 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
         for param in model.parameters():
             param.requires_grad = False
 
+        x_eval = torch.rand(N_INT, 1) * ROOM_SIZE
+        y_eval = torch.rand(N_INT, 1) * ROOM_SIZE
+        z_eval = torch.rand(N_INT, 1) * ROOM_SIZE
+
         h_params = nn.Parameter(torch.tensor([start_h1_x, start_h1_y, start_h1_z, start_h2_x, start_h2_y, start_h2_z], dtype=torch.float32))
-        h_optimizer = torch.optim.Adam([h_params], lr=0.1)
+        h_optimizer = torch.optim.Adam([h_params], lr=0.08)
 
         h1_px, h1_py, h1_pz = [], [], []
         h2_px, h2_py, h2_pz = [], [], []
@@ -272,14 +312,18 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
             h2_py.append(h_params[4].item())
             h2_pz.append(h_params[5].item())
 
-            hx1, hy1, hz1 = h_params[0]*torch.ones_like(x_int), h_params[1]*torch.ones_like(x_int), h_params[2]*torch.ones_like(x_int)
-            hx2, hy2, hz2 = h_params[3]*torch.ones_like(x_int), h_params[4]*torch.ones_like(x_int), h_params[5]*torch.ones_like(x_int)
+            hx1, hy1, hz1 = h_params[0]*torch.ones_like(x_eval), h_params[1]*torch.ones_like(x_eval), h_params[2]*torch.ones_like(x_eval)
+            hx2, hy2, hz2 = h_params[3]*torch.ones_like(x_eval), h_params[4]*torch.ones_like(x_eval), h_params[5]*torch.ones_like(x_eval)
 
-            T_pred = model(x_int, y_int, z_int, hx1, hy1, hz1, hx2, hy2, hz2)
-            loss_opt = torch.mean((T_pred - target_temp)**2)
+            T_pred = model(x_eval, y_eval, z_eval, hx1, hy1, hz1, hx2, hy2, hz2)
+            
+            dist_heaters_3d = (h_params[0]-h_params[3])**2 + (h_params[1]-h_params[4])**2 + (h_params[2]-h_params[5])**2
+            repulsion_3d = 30.0 / (dist_heaters_3d + 0.5)
+
+            loss_opt = torch.mean((T_pred - target_temp)**2) + repulsion_3d
             loss_opt.backward()
             h_optimizer.step()
-            h_params.data.clamp_(0.5, ROOM_SIZE - 0.5)
+            h_params.data.clamp_(1.0, ROOM_SIZE - 1.0)
 
             if epoch % (EPOCHS_P2 // 10) == 0:
                 p2_bar.progress(epoch / EPOCHS_P2)
@@ -292,9 +336,9 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
         colA.metric("Optimal Heater 1 (3D)", f"X: {h_params[0].item():.2f}m, Y: {h_params[1].item():.2f}m, Z: {h_params[2].item():.2f}m")
         colB.metric("Optimal Heater 2 (3D)", f"X: {h_params[3].item():.2f}m, Y: {h_params[4].item():.2f}m, Z: {h_params[5].item():.2f}m")
 
-        # 3D Volumetric Plotting
+        # 3D Volumetric Plotting with Clean 5°C, 10°C, 15°C... Ticks
         st.write("### 📊 Final 3D Volumetric Thermal Field & Trajectories")
-        grid_3d = np.linspace(0, ROOM_SIZE, 14)  # 14x14x14 volumetric grid for smooth rendering
+        grid_3d = np.linspace(0, ROOM_SIZE, 14)
         X, Y, Z = np.meshgrid(grid_3d, grid_3d, grid_3d)
         X_f = torch.tensor(X.flatten(), dtype=torch.float32).unsqueeze(1)
         Y_f = torch.tensor(Y.flatten(), dtype=torch.float32).unsqueeze(1)
@@ -307,19 +351,26 @@ if st.button("🚀 Run Diagnosis & Optimization", type="primary"):
                 h_params[3]*torch.ones_like(X_f), h_params[4]*torch.ones_like(X_f), h_params[5]*torch.ones_like(X_f)
             ).numpy().flatten()
 
+        t_min = 5
+        t_max = max(35, int(np.ceil(T_final_3d.max() / 5.0) * 5))
+        clean_ticks = np.arange(t_min, t_max + 1, 5)
+
         fig = plt.figure(figsize=(11, 9))
         ax = fig.add_subplot(111, projection='3d')
 
-        # Render semi-transparent 3D thermal cloud
-        scatter_cloud = ax.scatter(X.flatten(), Y.flatten(), Z.flatten(), c=T_final_3d, cmap=cm.inferno, alpha=0.12, s=18)
-        cbar = fig.colorbar(scatter_cloud, ax=ax, shrink=0.6, pad=0.1)
-        cbar.set_label('Temperature (°C)')
+        scatter_cloud = ax.scatter(
+            X.flatten(), Y.flatten(), Z.flatten(),
+            c=np.clip(T_final_3d, t_min, t_max),
+            cmap=cm.inferno, vmin=t_min, vmax=t_max,
+            alpha=0.15, s=20
+        )
+        cbar = fig.colorbar(scatter_cloud, ax=ax, ticks=clean_ticks, shrink=0.65, pad=0.1)
+        cbar.ax.set_yticklabels([f"{t}°C" for t in clean_ticks])
+        cbar.set_label('Temperature (°C)', fontsize=12)
 
-        # Render 3D Gradient Descent Paths
         ax.plot(h1_px, h1_py, h1_pz, color='cyan', linestyle='--', linewidth=3, label='H1 3D Path')
         ax.plot(h2_px, h2_py, h2_pz, color='lime', linestyle='--', linewidth=3, label='H2 3D Path')
 
-        # Start & Optimal 3D Markers
         ax.scatter([h1_px[0], h2_px[0]], [h1_py[0], h2_py[0]], [h1_pz[0], h2_pz[0]], color='blue', s=120, label='Start Position', depthshade=False)
         ax.scatter([h_params[0].item(), h_params[3].item()], [h_params[1].item(), h_params[4].item()], [h_params[2].item(), h_params[5].item()], color='red', marker='*', s=350, edgecolor='black', label='Optimal 3D Placement', depthshade=False)
 
